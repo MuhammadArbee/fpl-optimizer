@@ -131,6 +131,7 @@ def _fixture_points(
     total = appearance_pts + goal_pts + assist_pts + cs_pts + conceded_pts + save_pts + dc_pts + bonus_pts + card_pts
 
     breakdown = {
+        "total": round(total, 3),
         "appearance": round(appearance_pts, 3),
         "goals": round(goal_pts, 3),
         "assists": round(assist_pts, 3),
@@ -216,8 +217,27 @@ def predict(
         exp_minutes_col.append(round(minutes, 1))
 
     out = players_df.copy()
-    out["expected_points"] = exp_points
+    out["expected_points"] = exp_points  # NOTE: summed across all `num_gws` gameweeks, not a single-GW figure
     out["expected_minutes"] = exp_minutes_col
     out["breakdown"] = breakdowns
     out["num_fixtures"] = out["breakdown"].apply(len)
     return out
+
+
+def season_table(predicted: pd.DataFrame, gws: list[int]) -> pd.DataFrame:
+    """Pivot each player's fixture breakdowns (already computed by `predict`,
+    provided its horizon covered `gws`) into a player-by-gameweek points
+    matrix, for genuine gameweek-by-gameweek season planning rather than a
+    single lumped total that's easy to misread as a per-week figure."""
+    gw_cols = [f"GW{g}" for g in gws]
+    rows = []
+    for pid, row in predicted.iterrows():
+        per_gw = dict.fromkeys(gws, 0.0)
+        for fx in row["breakdown"]:
+            per_gw[fx["gameweek"]] = per_gw.get(fx["gameweek"], 0.0) + fx["total"]
+        rows.append({"id": pid, "name": row["name"], "position": row["position"], "price": row["price"],
+                      **{f"GW{g}": round(v, 2) for g, v in per_gw.items()}})
+    table = pd.DataFrame(rows).set_index("id")
+    table["season_total"] = table[gw_cols].sum(axis=1).round(2)
+    table["avg_per_gw"] = (table["season_total"] / len(gws)).round(2)
+    return table

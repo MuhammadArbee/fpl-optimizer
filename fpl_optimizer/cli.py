@@ -1,9 +1,11 @@
 """Command-line entry point.
 
     fpl fetch                          # refresh all cached FPL data
-    fpl squad --gw 5 --horizon 3        # best 15 under budget, weighing the next 3 GWs
+    fpl squad --horizon 3               # best 15 under budget, weighing the next 3 GWs
+    fpl season                          # project every remaining gameweek this season, GW-by-GW
     fpl transfers --team-id 1234567     # transfer suggestions for a real FPL team
     fpl player "Mohamed Salah"          # explain one player's expected points
+    fpl backtest                        # validate predictions against already-finished gameweeks
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ from . import api
 from .backtest import backtest_gameweek, finished_gameweeks
 from .data import current_and_next_gameweek, fixtures_frame, players_frame, scoring_rules, squad_rules, teams_frame
 from .optimize import build_squad, optimize_transfers
-from .predict import predict
+from .predict import predict, season_table
 
 pd.set_option("display.width", 160)
 pd.set_option("display.max_colwidth", 30)
@@ -61,8 +63,16 @@ def cmd_squad(args):
     budget = args.budget if args.budget is not None else rules.budget
     squad = build_squad(predicted, rules, budget=budget)
 
-    print(f"\nRecommended squad for GW{next_gw} (horizon: {args.horizon} GW{'s' if args.horizon > 1 else ''})")
-    print(f"Budget used: £{squad.total_cost}m / £{budget}m   Predicted starting-XI points: {squad.expected_points}\n")
+    span = f"GW{next_gw}" if args.horizon == 1 else f"GW{next_gw}-{next_gw + args.horizon - 1}"
+    print(f"\nRecommended squad for {span} ({args.horizon} gameweek{'s' if args.horizon > 1 else ''})")
+    print(f"Budget used: £{squad.total_cost}m / £{budget}m")
+    if args.horizon == 1:
+        print(f"Predicted starting-XI points: {squad.expected_points}\n")
+    else:
+        print(
+            f"Predicted starting-XI points: {squad.expected_points} total over {args.horizon} gameweeks "
+            f"(~{squad.expected_points / args.horizon:.1f}/GW average)\n"
+        )
     print(squad.summary(predicted).to_string(index=False))
     print(f"\nCaptain: {predicted.loc[squad.captain_id, 'name']}")
     print(f"Vice-captain: {predicted.loc[squad.vice_captain_id, 'name']}")
@@ -102,15 +112,45 @@ def cmd_player(args):
         sys.exit(1)
     for pid, row in matches.iterrows():
         print(f"\n{row['name']} ({row['position']}, {row['team_name']}, £{row['price']}m)")
-        print(f"Expected minutes: {row['expected_minutes']}   Expected points ({args.horizon} GW): {row['expected_points']}")
+        print(
+            f"Expected minutes: {row['expected_minutes']}   "
+            f"Expected points: {row['expected_points']} total over {args.horizon} gameweek{'s' if args.horizon > 1 else ''}"
+        )
         for fx in row["breakdown"]:
             venue = "H" if fx["is_home"] else "A"
-            print(f"  GW{fx['gameweek']} vs {fx['opponent']} ({venue}): {sum(v for k, v in fx.items() if k in ('appearance','goals','assists','clean_sheet','goals_conceded','saves','defensive_contribution','bonus','cards')):.2f} pts")
+            print(f"  GW{fx['gameweek']} vs {fx['opponent']} ({venue}): {fx['total']:.2f} pts")
             for k in ("goals", "assists", "clean_sheet", "goals_conceded", "saves", "defensive_contribution", "bonus", "cards", "appearance"):
                 if abs(fx[k]) > 0.005:
                     print(f"      {k}: {fx[k]:+.2f}")
             if fx["h2h_sample_size"] > 0:
                 print(f"      opponent history modifier: {fx['opponent_history_modifier']}x (from {fx['h2h_sample_size']} past meeting(s))")
+
+
+def cmd_season(args):
+    bootstrap, players_df, teams_df, fixtures_df, rules, scoring, summaries, next_gw = _load_raw_data(args.refresh)
+    last_gw = bootstrap["events"][-1]["id"]
+    gws = list(range(next_gw, last_gw + 1))
+
+    print(f"\nProjecting GW{next_gw} through GW{last_gw} ({len(gws)} gameweeks)...", file=sys.stderr)
+    predicted = predict(players_df, teams_df, fixtures_df, summaries, scoring, start_gw=next_gw, num_gws=len(gws))
+    table = season_table(predicted, gws)
+
+    if args.top:
+        chosen = table.sort_values("season_total", ascending=False).head(args.top)
+        print(f"\nTop {args.top} players by projected points, GW{next_gw}-{last_gw}:\n")
+    else:
+        squad = build_squad(predicted, rules, budget=args.budget if args.budget is not None else rules.budget)
+        chosen = table.loc[squad.squad_ids].sort_values(["position", "season_total"], ascending=[True, False])
+        print(f"\nFull-season squad projection, GW{next_gw}-{last_gw} (assumes no transfers along the way):\n")
+
+    display_cols = ["name", "position", "price", "season_total", "avg_per_gw"]
+    if args.full:
+        display_cols = ["name", "position", "price"] + [f"GW{g}" for g in gws] + ["season_total", "avg_per_gw"]
+    print(chosen[display_cols].to_string(index=False))
+
+    if args.csv:
+        table.to_csv(args.csv)
+        print(f"\nFull player x gameweek matrix ({len(table)} players x {len(gws)} gameweeks) written to {args.csv}", file=sys.stderr)
 
 
 def cmd_backtest(args):
@@ -181,6 +221,17 @@ def main():
     p_player = sub.add_parser("player", help="explain one player's expected-points breakdown", parents=[common])
     p_player.add_argument("name", help="player name (or partial match)")
     p_player.set_defaults(func=cmd_player)
+
+    p_season = sub.add_parser(
+        "season",
+        help="project points for every remaining gameweek this season (GW-by-GW, not just a lump total)",
+    )
+    p_season.add_argument("--refresh", action="store_true", help="force a re-fetch from the FPL API instead of using the cache")
+    p_season.add_argument("--budget", type=float, default=None, help="override budget in £m (default: 100.0)")
+    p_season.add_argument("--top", type=int, default=None, help="show the top N players by season total instead of building a squad")
+    p_season.add_argument("--full", action="store_true", help="show every gameweek's column instead of just the season total/average")
+    p_season.add_argument("--csv", type=str, default=None, help="write the full player x gameweek matrix (all players) to this CSV path")
+    p_season.set_defaults(func=cmd_season)
 
     p_backtest = sub.add_parser(
         "backtest",

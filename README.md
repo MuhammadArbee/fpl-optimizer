@@ -7,6 +7,7 @@ two questions every manager actually has:
 
 - **"What's the best 15 I can build this budget?"**
 - **"What transfers should I make to my existing team?"**
+- **"How is each player projected to score, gameweek by gameweek, for the rest of the season?"**
 
 Not affiliated with the Premier League or Fantasy Premier League — it's a
 personal project built against their public, unauthenticated API.
@@ -81,12 +82,24 @@ pip install -r requirements.txt
 
 ```bash
 fpl squad                              # best 15 under a £100m budget, next GW
-fpl squad --horizon 3                  # weigh the next 3 gameweeks instead of 1
+fpl squad --horizon 3                  # weigh the next 3 gameweeks (reports a TOTAL across all 3, not a per-GW figure)
 fpl squad --budget 95                  # a tighter budget
+fpl season                             # project every remaining gameweek this season, GW-by-GW, for your optimal squad
+fpl season --top 20                    # skip squad-building; just rank the top 20 players by season-long total
+fpl season --full --csv out.csv        # print every gameweek's column, and export the full player x gameweek matrix
 fpl transfers --team-id 1234567        # transfer suggestions for a real FPL team
-fpl player "Salah"                     # explain one player's expected points
+fpl player "Salah"                     # explain one player's expected points, gameweek by gameweek
 fpl fetch                              # force-refresh the local data cache
 ```
+
+`--horizon` sums predicted points across N gameweeks into a single figure —
+useful for "who's best over this run of fixtures," but easy to misread as a
+single-week score once N gets large. `fpl season` is the one that actually
+answers "predict every gameweek" — it never lumps weeks together, always
+reporting one column per gameweek plus a season total and a per-GW average
+for comparison. It assumes the same 15 players are kept all season (no
+transfers along the way), so treat far-future gameweeks as a rough guide —
+prices, injuries, and form will all move between now and then.
 
 (`fpl` isn't installed as a standalone command — run these as
 `python -m fpl_optimizer.cli <command>`, or `pip install -e .` first.)

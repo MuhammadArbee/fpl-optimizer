@@ -17,7 +17,7 @@ from fpl_optimizer import api
 from fpl_optimizer.backtest import backtest_gameweek, finished_gameweeks
 from fpl_optimizer.data import current_and_next_gameweek, fixtures_frame, players_frame, scoring_rules, squad_rules, teams_frame
 from fpl_optimizer.optimize import build_squad
-from fpl_optimizer.predict import predict
+from fpl_optimizer.predict import predict, season_table
 
 st.set_page_config(page_title="FPL Squad Optimizer", layout="wide")
 
@@ -52,6 +52,18 @@ def load_predictions(horizon: int, refresh: bool) -> tuple[pd.DataFrame, pd.Data
     bootstrap, players_df, teams_df, fixtures_df, rules, scoring, summaries, next_gw = load_raw_data(refresh)
     predicted = predict(players_df, teams_df, fixtures_df, summaries, scoring, start_gw=next_gw, num_gws=horizon)
     return predicted, teams_df, rules, next_gw
+
+
+@st.cache_data(show_spinner=False, ttl=6 * 60 * 60)
+def load_season(refresh: bool):
+    """Project every remaining gameweek this season (GW-by-GW), not just a
+    lump total — the full-season answer to "who should I use each week"."""
+    bootstrap, players_df, teams_df, fixtures_df, rules, scoring, summaries, next_gw = load_raw_data(refresh)
+    last_gw = bootstrap["events"][-1]["id"]
+    gws = list(range(next_gw, last_gw + 1))
+    predicted = predict(players_df, teams_df, fixtures_df, summaries, scoring, start_gw=next_gw, num_gws=len(gws))
+    table = season_table(predicted, gws)
+    return predicted, table, rules, gws
 
 
 @st.cache_data(show_spinner=False, ttl=6 * 60 * 60)
@@ -115,16 +127,19 @@ def main():
     with st.spinner("Loading..."):
         predicted, teams_df, rules, next_gw = load_predictions(horizon, refresh)
 
-    tab_squad, tab_players, tab_player_detail, tab_backtest = st.tabs(
-        ["Optimal Squad", "All Players", "Player Explorer", "Backtest"]
+    tab_squad, tab_players, tab_player_detail, tab_season, tab_backtest = st.tabs(
+        ["Optimal Squad", "All Players", "Player Explorer", "Season Planner", "Backtest"]
     )
 
     with tab_squad:
         squad = build_squad(predicted, rules, budget=budget)
         c1, c2, c3 = st.columns(3)
         c1.metric("Squad cost", f"£{squad.total_cost}m")
-        c2.metric("Predicted starting-XI points", f"{squad.expected_points}")
-        c3.metric("Gameweek", f"GW{next_gw}")
+        points_label = "Predicted starting-XI points" if horizon == 1 else f"Predicted points ({horizon} GWs total)"
+        c2.metric(points_label, f"{squad.expected_points}")
+        c3.metric("Gameweek", f"GW{next_gw}" if horizon == 1 else f"GW{next_gw}-{next_gw + horizon - 1}")
+        if horizon > 1:
+            st.caption(f"That's a total across {horizon} gameweeks — roughly {squad.expected_points / horizon:.1f}/GW on average.")
         render_pitch(squad, predicted)
 
     with tab_players:
@@ -142,6 +157,37 @@ def main():
             matches = predicted[predicted["name"].str.contains(name, case=False, na=False)]
             for _, row in matches.head(5).iterrows():
                 render_player_breakdown(row)
+
+    with tab_season:
+        st.caption(
+            "Projects every remaining gameweek this season, individually — not a single lumped total. "
+            "Assumes the same squad all season (no transfers), so treat far-future gameweeks as a rough guide: "
+            "form, injuries and prices will all move between now and then."
+        )
+        with st.spinner("Projecting the rest of the season (this fetches full player histories, can take a minute)..."):
+            season_predicted, table, season_rules, gws = load_season(refresh)
+
+        view = st.radio("Show", ["My optimal squad", "Top players overall"], horizontal=True)
+        if view == "Top players overall":
+            top_n = st.slider("How many players", 5, 50, 15)
+            chosen = table.sort_values("season_total", ascending=False).head(top_n)
+        else:
+            season_squad = build_squad(season_predicted, season_rules, budget=budget)
+            chosen = table.loc[season_squad.squad_ids].sort_values(["position", "season_total"], ascending=[True, False])
+
+        gw_cols = [f"GW{g}" for g in gws]
+        st.dataframe(
+            chosen[["name", "position", "price", "season_total", "avg_per_gw"] + gw_cols],
+            use_container_width=True,
+            height=500,
+        )
+        st.caption("Download the full player x gameweek matrix (all ~660 players) as CSV:")
+        st.download_button(
+            "Download full season projection (CSV)",
+            table.to_csv().encode("utf-8"),
+            file_name=f"fpl_season_projection_gw{gws[0]}-{gws[-1]}.csv",
+            mime="text/csv",
+        )
 
     with tab_backtest:
         st.caption(
