@@ -13,7 +13,7 @@ import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from fpl_optimizer import api
+from fpl_optimizer import api, ml
 from fpl_optimizer.backtest import backtest_gameweek, finished_gameweeks
 from fpl_optimizer.data import current_and_next_gameweek, fixtures_frame, players_frame, scoring_rules, squad_rules, teams_frame
 from fpl_optimizer.optimize import build_squad
@@ -47,21 +47,28 @@ def load_raw_data(refresh: bool):
     return bootstrap, players_df, teams_df, fixtures_df, rules, scoring, summaries, next_gw
 
 
+def _predict(players_df, teams_df, fixtures_df, summaries, scoring, start_gw, num_gws, engine):
+    if engine == "linear":
+        model, _ = ml.load_model()  # raises FileNotFoundError if `fpl train` hasn't been run — caller handles it
+        return ml.predict_with_model(players_df, teams_df, fixtures_df, summaries, model, start_gw=start_gw, num_gws=num_gws)
+    return predict(players_df, teams_df, fixtures_df, summaries, scoring, start_gw=start_gw, num_gws=num_gws)
+
+
 @st.cache_data(show_spinner=False, ttl=6 * 60 * 60)
-def load_predictions(horizon: int, refresh: bool) -> tuple[pd.DataFrame, pd.DataFrame, object, int]:
+def load_predictions(horizon: int, refresh: bool, engine: str = "heuristic") -> tuple[pd.DataFrame, pd.DataFrame, object, int]:
     bootstrap, players_df, teams_df, fixtures_df, rules, scoring, summaries, next_gw = load_raw_data(refresh)
-    predicted = predict(players_df, teams_df, fixtures_df, summaries, scoring, start_gw=next_gw, num_gws=horizon)
+    predicted = _predict(players_df, teams_df, fixtures_df, summaries, scoring, next_gw, horizon, engine)
     return predicted, teams_df, rules, next_gw
 
 
 @st.cache_data(show_spinner=False, ttl=6 * 60 * 60)
-def load_season(refresh: bool):
+def load_season(refresh: bool, engine: str = "heuristic"):
     """Project every remaining gameweek this season (GW-by-GW), not just a
     lump total — the full-season answer to "who should I use each week"."""
     bootstrap, players_df, teams_df, fixtures_df, rules, scoring, summaries, next_gw = load_raw_data(refresh)
     last_gw = bootstrap["events"][-1]["id"]
     gws = list(range(next_gw, last_gw + 1))
-    predicted = predict(players_df, teams_df, fixtures_df, summaries, scoring, start_gw=next_gw, num_gws=len(gws))
+    predicted = _predict(players_df, teams_df, fixtures_df, summaries, scoring, next_gw, len(gws), engine)
     table = season_table(predicted, gws)
     return predicted, table, rules, gws
 
@@ -70,7 +77,11 @@ def load_season(refresh: bool):
 def run_backtest(refresh: bool):
     bootstrap, players_df, teams_df, fixtures_df, rules, scoring, summaries, _ = load_raw_data(refresh)
     gws = [g for g in finished_gameweeks(bootstrap) if g >= 2]
-    return [backtest_gameweek(bootstrap, players_df, teams_df, fixtures_df, summaries, scoring, rules, gw) for gw in gws]
+    results = [backtest_gameweek(bootstrap, players_df, teams_df, fixtures_df, summaries, scoring, rules, gw) for gw in gws]
+
+    training_df = ml.build_training_set(players_df, teams_df, fixtures_df, summaries, scoring, gws)
+    linear_folds = {f.test_gw: f for f in ml.evaluate_forward_chaining(training_df)}
+    return results, linear_folds
 
 
 def render_pitch(squad, predicted: pd.DataFrame):
@@ -118,14 +129,24 @@ def main():
         "that maximises points under the £100m budget and FPL's own squad rules."
     )
 
+    model_available = ml.MODEL_PATH.exists()
     with st.sidebar:
         st.header("Settings")
         horizon = st.slider("Gameweek horizon", min_value=1, max_value=6, value=1, help="Weigh expected points over this many upcoming gameweeks")
         budget = st.number_input("Budget (£m)", min_value=50.0, max_value=100.0, value=100.0, step=0.5)
+        engine = st.radio(
+            "Prediction engine",
+            ["heuristic", "linear"],
+            help="'heuristic': hand-built scoring-rule model. 'linear': a Ridge regression trained on finished "
+            "gameweeks (`fpl train`) — learns feature weights from data instead of hand-picked constants.",
+            disabled=not model_available,
+        )
+        if not model_available:
+            st.caption("Linear engine needs a trained model — run `fpl train` on the CLI first.")
         refresh = st.button("Refresh data from FPL API")
 
     with st.spinner("Loading..."):
-        predicted, teams_df, rules, next_gw = load_predictions(horizon, refresh)
+        predicted, teams_df, rules, next_gw = load_predictions(horizon, refresh, engine)
 
     tab_squad, tab_players, tab_player_detail, tab_season, tab_backtest = st.tabs(
         ["Optimal Squad", "All Players", "Player Explorer", "Season Planner", "Backtest"]
@@ -165,7 +186,7 @@ def main():
             "form, injuries and prices will all move between now and then."
         )
         with st.spinner("Projecting the rest of the season (this fetches full player histories, can take a minute)..."):
-            season_predicted, table, season_rules, gws = load_season(refresh)
+            season_predicted, table, season_rules, gws = load_season(refresh, engine)
 
         view = st.radio("Show", ["My optimal squad", "Top players overall"], horizontal=True)
         if view == "Top players overall":
@@ -196,7 +217,7 @@ def main():
             "is worth anything, not just a demo of it running."
         )
         with st.spinner("Backtesting finished gameweeks..."):
-            results = run_backtest(refresh)
+            results, linear_folds = run_backtest(refresh)
         if not results:
             st.info("No finished gameweeks (beyond GW1) yet — nothing to backtest against.")
         else:
@@ -204,10 +225,11 @@ def main():
                 [
                     {
                         "GW": r.gameweek,
-                        "Model r": round(r.pearson_r, 3),
                         "Naive r": round(r.naive_pearson_r, 3),
-                        "Model MAE": round(r.mae, 3),
-                        "Naive MAE": round(r.naive_mae, 3),
+                        "Heuristic r": round(r.pearson_r, 3),
+                        "Linear r": round(linear_folds[r.gameweek].linear_r, 3) if r.gameweek in linear_folds else None,
+                        "Heuristic MAE": round(r.mae, 3),
+                        "Linear MAE": round(linear_folds[r.gameweek].linear_mae, 3) if r.gameweek in linear_folds else None,
                         "Squad pts": r.squad_actual_points,
                         "Avg manager": r.average_entry_score,
                         "Top manager": r.highest_score,
@@ -217,25 +239,43 @@ def main():
             )
             st.dataframe(summary, hide_index=True, use_container_width=True)
 
-            avg_model_r = summary["Model r"].mean()
+            avg_heur_r = summary["Heuristic r"].mean()
             avg_naive_r = summary["Naive r"].mean()
             avg_squad_pts = summary["Squad pts"].mean()
             avg_mgr = summary["Avg manager"].mean()
             c1, c2, c3 = st.columns(3)
-            c1.metric("Model vs. naive baseline (r)", f"{avg_model_r:.3f}", f"{avg_model_r - avg_naive_r:+.3f}")
+            c1.metric("Heuristic vs. naive (r)", f"{avg_heur_r:.3f}", f"{avg_heur_r - avg_naive_r:+.3f}")
             c2.metric("Backtested squad pts/GW", f"{avg_squad_pts:.1f}")
             c3.metric("Avg. real manager pts/GW", f"{avg_mgr:.1f}")
 
-            if avg_model_r <= avg_naive_r:
+            if avg_heur_r <= avg_naive_r:
                 st.warning(
-                    "Over these gameweeks, the full model doesn't yet beat the naive baseline (each player's own "
+                    "Over these gameweeks, the heuristic model doesn't yet beat the naive baseline (each player's own "
                     "season-to-date average). This early in a season, team-strength and fixture-difficulty signals "
                     "are themselves built on very few matches, so they add noise rather than signal — and 2-4 "
                     "gameweeks is too small a sample to draw a firm conclusion either way. Worth re-checking as "
                     "more gameweeks accumulate."
                 )
             else:
-                st.success("Over these gameweeks, the full model beats the naive season-average baseline.")
+                st.success("Over these gameweeks, the heuristic model beats the naive season-average baseline.")
+
+            if linear_folds:
+                avg_linear_r = sum(f.linear_r for f in linear_folds.values()) / len(linear_folds)
+                comparable_gws = sorted(linear_folds.keys())
+                comparable_naive_r = summary[summary["GW"].isin(comparable_gws)]["Naive r"].mean()
+                if avg_linear_r > comparable_naive_r:
+                    st.success(
+                        f"The trained linear model beats the naive baseline over GW{comparable_gws} "
+                        f"({avg_linear_r:.3f} vs {comparable_naive_r:.3f} r), forward-chained so it was never "
+                        f"trained on the gameweek it's scored against."
+                    )
+                else:
+                    st.warning(
+                        f"The trained linear model does not yet beat the naive baseline over GW{comparable_gws} "
+                        f"({avg_linear_r:.3f} vs {comparable_naive_r:.3f} r)."
+                    )
+            else:
+                st.caption("Not enough finished gameweeks yet for a forward-chaining linear-model comparison (needs at least 2).")
 
             gw_choice = st.selectbox("Inspect one gameweek's predictions vs. actual", [r.gameweek for r in results])
             chosen = next(r for r in results if r.gameweek == gw_choice)

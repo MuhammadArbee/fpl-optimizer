@@ -1,0 +1,97 @@
+{
+  "feature_names": [
+    "price",
+    "is_gkp",
+    "is_def",
+    "is_mid",
+    "is_fwd",
+    "minutes_share",
+    "is_home",
+    "goals_per_90",
+    "assists_per_90",
+    "xg_per_90",
+    "xa_per_90",
+    "bps_per_90",
+    "defensive_actions_per_90",
+    "saves_per_90",
+    "yellow_per_90",
+    "red_per_90",
+    "opponent_defence_leakiness",
+    "opponent_attack",
+    "attack_multiplier",
+    "expected_goals",
+    "expected_assists",
+    "p_clean_sheet",
+    "expected_actions",
+    "expected_bps",
+    "opponent_history_modifier",
+    "naive_points"
+  ],
+  "trained_on_gws": [
+    2,
+    3,
+    4
+  ],
+  "n_training_rows": 1977,
+  "alpha": 5.736152510448681,
+  "intercept": 1.3778452200303475,
+  "coefficients": {
+    "price": 0.7768866109051016,
+    "is_gkp": 0.39897043717806113,
+    "is_def": -0.3412879826469304,
+    "is_mid": 0.03585510974204986,
+    "is_fwd": 0.05720644657652496,
+    "minutes_share": 1.4859120851987058,
+    "is_home": -0.17161277723157012,
+    "goals_per_90": -0.5478926293101608,
+    "assists_per_90": -0.40269210540722433,
+    "xg_per_90": 0.13949575241193168,
+    "xa_per_90": -0.04193942786300853,
+    "bps_per_90": 0.033289862230086786,
+    "defensive_actions_per_90": 0.07374772589645318,
+    "saves_per_90": -0.7875764125168951,
+    "yellow_per_90": 0.23846266484675707,
+    "red_per_90": 0.029908856990481337,
+    "opponent_defence_leakiness": -0.07781002337425624,
+    "opponent_attack": -0.18384214662856374,
+    "attack_multiplier": 0.28616639337583105,
+    "expected_goals": -0.08637550775877889,
+    "expected_assists": 0.1369639317250222,
+    "p_clean_sheet": -0.2118575612504865,
+    "expected_actions": -0.3924702288907955,
+    "expected_bps": -1.1110017557420435,
+    "opponent_history_modifier": 0.0,
+    "naive_points": 1.1240257313781175
+  },
+  "cross_validation": [
+    {
+      "test_gw": 3,
+      "train_gws": [
+        2
+      ],
+      "n_train": 659,
+      "n_test": 659,
+      "naive_r": 0.42,
+      "heuristic_r": 0.3973,
+      "linear_r": 0.4894,
+      "naive_mae": 1.33,
+      "heuristic_mae": 1.8483,
+      "linear_mae": 1.3561
+    },
+    {
+      "test_gw": 4,
+      "train_gws": [
+        2,
+        3
+      ],
+      "n_train": 1318,
+      "n_test": 659,
+      "naive_r": 0.4827,
+      "heuristic_r": 0.3918,
+      "linear_r": 0.4976,
+      "naive_mae": 1.3543,
+      "heuristic_mae": 1.9741,
+      "linear_mae": 1.4403
+    }
+  ]
+}

@@ -72,17 +72,24 @@ class FixturePrediction:
     breakdown: dict[str, float] = field(default_factory=dict)
 
 
-def _fixture_points(
-    position: str,
+def fixture_context(
     form: PlayerForm,
-    scoring: ScoringRules,
     team_strength: TeamStrength,
     team_id: int,
     opponent_id: int,
     is_home: bool,
     minutes: float,
     opp_modifier: float,
-) -> tuple[float, dict[str, float]]:
+) -> dict[str, float]:
+    """The shared numeric groundwork for one player's one fixture — fixture
+    difficulty, expected goal involvement, clean-sheet probability, expected
+    bookings, etc. Consumed by two different "heads": `_fixture_points`
+    below applies FPL's fixed scoring formula to turn these into a points
+    estimate; `ml.py` instead feeds them into a regression model that learns
+    its own weights from finished gameweeks. Keeping this math in one place
+    means both heads see identical inputs, so any difference in their output
+    reflects the modeling choice, not a data discrepancy.
+    """
     home_baseline = team_strength.league_avg_home_goals
     away_baseline = team_strength.league_avg_away_goals
     mid_baseline = (home_baseline + away_baseline) / 2.0
@@ -106,6 +113,47 @@ def _fixture_points(
     expected_goals_conceded = opponent_baseline * opponent_attack * own_defence_leakiness
     p_clean_sheet = math.exp(-expected_goals_conceded)
 
+    expected_saves = form.saves_per_90 * minutes_share
+    expected_actions = form.defensive_actions_per_90 * minutes_share
+    expected_bps = form.bps_per_90 * minutes_share
+
+    return {
+        "minutes": minutes,
+        "minutes_share": minutes_share,
+        "venue_factor": venue_factor,
+        "is_home": float(is_home),
+        "opponent_defence_leakiness": opponent_defence_leakiness,
+        "opponent_attack": opponent_attack,
+        "attack_multiplier": attack_multiplier,
+        "expected_goals": expected_goals,
+        "expected_assists": expected_assists,
+        "expected_goals_conceded": expected_goals_conceded,
+        "p_clean_sheet": p_clean_sheet,
+        "expected_saves": expected_saves,
+        "expected_actions": expected_actions,
+        "expected_bps": expected_bps,
+        "opponent_history_modifier": opp_modifier,
+    }
+
+
+def _fixture_points(
+    position: str,
+    form: PlayerForm,
+    scoring: ScoringRules,
+    team_strength: TeamStrength,
+    team_id: int,
+    opponent_id: int,
+    is_home: bool,
+    minutes: float,
+    opp_modifier: float,
+) -> tuple[float, dict[str, float]]:
+    ctx = fixture_context(form, team_strength, team_id, opponent_id, is_home, minutes, opp_modifier)
+    minutes_share = ctx["minutes_share"]
+    expected_goals = ctx["expected_goals"]
+    expected_assists = ctx["expected_assists"]
+    expected_goals_conceded = ctx["expected_goals_conceded"]
+    p_clean_sheet = ctx["p_clean_sheet"]
+
     appearance_pts = scoring.long_play * min(minutes / 60.0, 1.0) if minutes > 0 else 0.0
     goal_pts = expected_goals * scoring.goals_scored.get(position, 0)
     assist_pts = expected_assists * scoring.assists
@@ -114,16 +162,14 @@ def _fixture_points(
 
     save_pts = 0.0
     if position == "GKP":
-        expected_saves = form.saves_per_90 * minutes_share
-        save_pts = (expected_saves / 3.0) * 1.0  # 1 pt per 3 saves
+        save_pts = (ctx["expected_saves"] / 3.0) * 1.0  # 1 pt per 3 saves
 
     threshold = scoring.defensive_contribution_threshold.get(position, 999999)
-    expected_actions = form.defensive_actions_per_90 * minutes_share
+    expected_actions = ctx["expected_actions"]
     p_hit_threshold = _poisson_sf(threshold, expected_actions) if expected_actions > 0 else 0.0
     dc_pts = p_hit_threshold * scoring.defensive_contribution.get(position, 0)
 
-    expected_bps = form.bps_per_90 * minutes_share
-    bonus_pts = min(BONUS_CAP, max(0.0, expected_bps - BONUS_BPS_BASELINE) * BONUS_SCALE)
+    bonus_pts = min(BONUS_CAP, max(0.0, ctx["expected_bps"] - BONUS_BPS_BASELINE) * BONUS_SCALE)
 
     card_pts = -(form.yellow_per_90 * minutes_share) * abs(scoring.yellow_cards)
     card_pts += -(form.red_per_90 * minutes_share) * abs(scoring.red_cards)

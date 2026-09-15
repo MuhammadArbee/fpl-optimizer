@@ -30,6 +30,8 @@ import pandas as pd
 
 from .data import ScoringRules, SquadRules
 from .features import (
+    PlayerForm,
+    TeamStrength,
     compute_player_form,
     compute_team_strengths,
     expected_minutes,
@@ -54,6 +56,62 @@ def _naive_prediction(prior_history: list[dict]) -> float:
     return float(sum(h["total_points"] for h in played) / len(played))
 
 
+@dataclass
+class PreGwContext:
+    """Everything needed to reconstruct predictions as of just before `gw`,
+    built once and shared by both the heuristic scorer (`predict_as_of`) and
+    the learned-model featurizer (`ml.build_training_set`) so neither has to
+    re-derive form/team-strength truncation on its own."""
+
+    gw: int
+    team_strength: TeamStrength
+    this_gw_fixtures: pd.DataFrame
+    forms: dict[int, PlayerForm]  # already shrunk toward the position prior
+    prior_histories: dict[int, list[dict]]
+    minutes: dict[int, float]
+
+
+def prepare_as_of(
+    players_df: pd.DataFrame,
+    teams_df: pd.DataFrame,
+    fixtures_df: pd.DataFrame,
+    summaries: dict[int, dict],
+    gw: int,
+) -> PreGwContext:
+    prior_fixtures = fixtures_df[fixtures_df["event"] < gw]
+    team_strength = compute_team_strengths(prior_fixtures, teams_df)
+    this_gw_fixtures = fixtures_df[fixtures_df["event"] == gw]
+
+    prior_histories: dict[int, list[dict]] = {}
+    raw_forms: dict[int, PlayerForm] = {}
+    for pid in players_df.index:
+        history = summaries.get(pid, {}).get("history", [])
+        prior_history = [h for h in history if h.get("round", 0) < gw]
+        prior_histories[pid] = prior_history
+        raw_forms[pid] = compute_player_form(prior_history)
+
+    forms_by_position: dict[str, list[PlayerForm]] = {}
+    for pid, form in raw_forms.items():
+        if form.games_seen > 0:
+            forms_by_position.setdefault(players_df.loc[pid, "position"], []).append(form)
+    priors = position_rate_priors(forms_by_position)
+
+    forms: dict[int, PlayerForm] = {}
+    minutes: dict[int, float] = {}
+    for pid, row in players_df.iterrows():
+        form = shrink_form(raw_forms[pid], priors[row["position"]])
+        forms[pid] = form
+        # retroactive injury/availability status isn't exposed by the API;
+        # assume fully fit and let recent minutes drive the estimate instead
+        minutes[pid] = expected_minutes(form, "a", None)
+
+    return PreGwContext(gw, team_strength, this_gw_fixtures, forms, prior_histories, minutes)
+
+
+def team_fixtures_for(ctx: PreGwContext, team_id: int) -> pd.DataFrame:
+    return ctx.this_gw_fixtures[(ctx.this_gw_fixtures["team_h"] == team_id) | (ctx.this_gw_fixtures["team_a"] == team_id)]
+
+
 def predict_as_of(
     players_df: pd.DataFrame,
     teams_df: pd.DataFrame,
@@ -65,37 +123,16 @@ def predict_as_of(
     """The same model as predict.predict, rebuilt strictly from information
     available before `gw`. Adds predicted_points, naive_points and (when
     known) actual_points columns to a copy of players_df."""
-    prior_fixtures = fixtures_df[fixtures_df["event"] < gw]
-    team_strength = compute_team_strengths(prior_fixtures, teams_df)
-    this_gw_fixtures = fixtures_df[fixtures_df["event"] == gw]
-
-    prior_histories: dict[int, list[dict]] = {}
-    raw_forms = {}
-    for pid in players_df.index:
-        history = summaries.get(pid, {}).get("history", [])
-        prior_history = [h for h in history if h.get("round", 0) < gw]
-        prior_histories[pid] = prior_history
-        raw_forms[pid] = compute_player_form(prior_history)
-
-    forms_by_position: dict[str, list] = {}
-    for pid, form in raw_forms.items():
-        if form.games_seen > 0:
-            forms_by_position.setdefault(players_df.loc[pid, "position"], []).append(form)
-    priors = position_rate_priors(forms_by_position)
+    ctx = prepare_as_of(players_df, teams_df, fixtures_df, summaries, gw)
 
     predicted_points, naive_points, actual_points = [], [], []
     for pid, row in players_df.iterrows():
-        prior_history = prior_histories[pid]
-        form = shrink_form(raw_forms[pid], priors[row["position"]])
-        # retroactive injury/availability status isn't exposed by the API;
-        # assume fully fit and let recent minutes drive the estimate instead
-        minutes = expected_minutes(form, "a", None)
+        prior_history = ctx.prior_histories[pid]
+        form = ctx.forms[pid]
+        minutes = ctx.minutes[pid]
 
-        team_fixtures = this_gw_fixtures[
-            (this_gw_fixtures["team_h"] == row["team"]) | (this_gw_fixtures["team_a"] == row["team"])
-        ]
         total_pts = 0.0
-        for _, fx in team_fixtures.iterrows():
+        for _, fx in team_fixtures_for(ctx, row["team"]).iterrows():
             is_home = fx["team_h"] == row["team"]
             opponent_id = fx["team_a"] if is_home else fx["team_h"]
             opp_modifier, _ = opponent_history_modifier(prior_history, opponent_id)
@@ -103,7 +140,7 @@ def predict_as_of(
                 position=row["position"],
                 form=form,
                 scoring=scoring_rules,
-                team_strength=team_strength,
+                team_strength=ctx.team_strength,
                 team_id=row["team"],
                 opponent_id=opponent_id,
                 is_home=is_home,

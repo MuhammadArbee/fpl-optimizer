@@ -70,6 +70,63 @@ transfer count (0 through 5), capping how many players may come from outside
 the current squad each time, then picks whichever count maximises expected
 points minus the `-4`-per-transfer hit for going over your free transfers.
 
+## A learned alternative: `ml.py`
+
+The heuristic model above bakes in hand-picked constants — a 60/40 blend of
+xG vs. actual goals, a BPS-to-bonus-points scaling factor — reasoned about,
+not fit to data. `ml.py` instead **trains a Ridge regression on finished
+gameweeks**, using the exact same underlying features (form, fixture
+context, clean-sheet probability — both models draw from
+`predict.fixture_context`), but lets the weight on each one come from what
+actually happened rather than a guess.
+
+```bash
+fpl train                 # fit + validate the model, then save it
+fpl squad --engine linear # use it instead of the heuristic for any command
+```
+
+Why Ridge instead of plain linear regression: with only a handful of
+finished gameweeks, training rows number in the low thousands and several
+features are correlated (e.g. `xg_per_90` and `goals_per_90`) — plain
+least-squares would overfit that noise, so an L2 penalty keeps coefficients
+stable, and `RidgeCV` picks the penalty strength via cross-validation
+automatically.
+
+`fpl train` validates itself honestly via **forward-chaining**: to score
+gameweek N, it only ever trains on gameweeks strictly before N — the same
+discipline as the backtest above, so the reported accuracy can't leak future
+information. As measured right now (GW3-4, the only gameweeks with enough
+prior data to train on):
+
+| Test GW | Naive r | Heuristic r | Linear r |
+|---------|---------|--------------|----------|
+| 3       | 0.420   | 0.397        | 0.489    |
+| 4       | 0.483   | 0.392        | 0.498    |
+
+The learned model beats **both** the heuristic and the naive baseline here
+(0.494 avg vs. 0.451 naive vs. 0.395 heuristic) — a real, measured
+improvement, not just a demo. Two honest caveats:
+
+- This is still only 2 validation folds. It's a genuine result, not a
+  guarantee it holds up — re-run `fpl train` as more gameweeks accumulate.
+- With this little data and correlated features, **individual coefficient
+  signs shouldn't be over-interpreted causally**. A few learned weights look
+  counterintuitive (e.g. a negative weight on recent goals-per-90) — Ridge
+  minimizes prediction error across all features jointly, not each
+  feature's isolated causal effect, so a flipped sign likely reflects
+  collinearity with price/minutes rather than "scoring more actually hurts
+  your points." The model's saved metadata (`data/model/linear_model_meta.json`)
+  records every learned weight, so this is checkable, not hidden.
+
+The fitted model is saved via `joblib` alongside a JSON sidecar with feature
+names, training gameweeks, and cross-validated metrics — inspectable, not a
+black box. `--engine linear` works on `squad`, `season`, `player`,
+`transfers` and shows up in `backtest`'s comparison table automatically. One
+difference: the linear model's per-fixture breakdown only reports a single
+`total` — a fitted regression doesn't decompose into "X points for goals, Y
+for assists" the way the rule-based heuristic does, so it doesn't fabricate
+one.
+
 ## Getting started
 
 ```bash
@@ -90,6 +147,8 @@ fpl season --full --csv out.csv        # print every gameweek's column, and expo
 fpl transfers --team-id 1234567        # transfer suggestions for a real FPL team
 fpl player "Salah"                     # explain one player's expected points, gameweek by gameweek
 fpl fetch                              # force-refresh the local data cache
+fpl train                              # fit the learned (Ridge regression) model on finished gameweeks
+fpl squad --engine linear              # use the trained model instead of the heuristic, on any command above
 ```
 
 `--horizon` sums predicted points across N gameweeks into a single figure —
@@ -114,7 +173,9 @@ streamlit run app/dashboard.py
 ```
 
 Gives you an interactive pitch view of the optimal squad, a sortable table
-of every player's expected points, and a per-player breakdown explorer.
+of every player's expected points, a per-player breakdown explorer, a season
+planner, and a backtest tab — with a sidebar toggle between the heuristic
+and trained-linear engines (the latter needs `fpl train` run at least once).
 
 ### Backtesting
 
@@ -132,24 +193,27 @@ a demo of it running. It reports:
 - **Point-level accuracy**: Pearson/Spearman correlation and mean absolute
   error between predicted and actual points, benchmarked against a naive
   baseline (each player's own season-to-date average, with no fixture or
-  form-recency information at all).
+  form-recency information at all) — and, when a trained model exists, the
+  linear engine's forward-chained accuracy too, in the same table.
 - **Squad-level validation**: what the optimizer's recommended squad would
   actually have scored that gameweek, against the average and highest
   scores real FPL managers achieved (both reported by the API itself).
 
-**Results as measured against GW2-4 of the 2026/27 season** (the only
-finished gameweeks so far):
+**Heuristic model results, GW2-4 of the 2026/27 season** (the only finished
+gameweeks so far):
 
-| GW | Model r | Naive r | Model MAE | Naive MAE | Squad pts | Avg. manager |
-|----|---------|---------|-----------|-----------|-----------|--------------|
-| 2  | 0.310   | 0.411   | 1.93      | 1.35      | 49        | 81           |
-| 3  | 0.397   | 0.420   | 1.85      | 1.33      | 53        | 51           |
-| 4  | 0.392   | 0.483   | 1.97      | 1.35      | 46        | 69           |
+| GW | Heuristic r | Naive r | Heuristic MAE | Naive MAE | Squad pts | Avg. manager |
+|----|-------------|---------|---------------|-----------|-----------|--------------|
+| 2  | 0.310       | 0.411   | 1.93          | 1.35      | 49        | 81           |
+| 3  | 0.397       | 0.420   | 1.85          | 1.33      | 53        | 51           |
+| 4  | 0.392       | 0.483   | 1.97          | 1.35      | 46        | 69           |
 
-Told straight: **over this tiny sample, the full model does not yet beat
+Told straight: **over this tiny sample, the heuristic model does not beat
 the naive "just use their recent average" baseline**, and the backtested
-squads underperformed the average real manager in 2 of 3 gameweeks. I
-looked into why rather than just reporting the number:
+squads underperformed the average real manager in 2 of 3 gameweeks. (The
+trained linear model — see below — does beat both, which is exactly why it
+exists.) I looked into why the heuristic falls short rather than just
+reporting the number:
 
 - I tried strengthening the small-sample shrinkage (the mechanism that
   prevents one lucky early game from dominating a player's rate) across a
@@ -193,14 +257,15 @@ fpl_optimizer/
   api.py        FPL API client with disk caching
   data.py       raw JSON -> DataFrames; reads squad/scoring rules live from the API
   features.py   team strength ratings, player form, minutes model, shrinkage
-  predict.py    the expected-points model
+  predict.py    the expected-points (heuristic) model
   optimize.py   the ILP squad builder and transfer optimizer
   backtest.py   validates predictions against already-finished gameweeks
+  ml.py         the trained (Ridge regression) alternative model
   cli.py        command-line interface
 app/
   dashboard.py  Streamlit UI
 tests/
-  test_optimize.py, test_features.py
+  test_optimize.py, test_features.py, test_backtest.py, test_ml.py
 ```
 
 ## Known limitations / natural next steps
@@ -213,10 +278,19 @@ tests/
 - **No price-change or long-term squad planning** (e.g. holding a transfer
   for a better week, chip strategy) — each run is a fresh optimization, not
   a multi-week plan.
-- The model **has** been backtested (see above) — and, honestly, hasn't yet
-  demonstrated it beats a naive baseline over the 3 gameweeks available so
-  far this season. It's built on sound statistical principles (Poisson goal
-  models, recency weighting, Bayesian shrinkage) but early-season team
-  strength ratings are themselves low-sample, which likely blunts the
-  fixture-difficulty signal the model leans on. Worth re-running `fpl
-  backtest` as more gameweeks accumulate before trusting its picks blindly.
+- The heuristic model **has** been backtested (see above) — and, honestly,
+  hasn't yet demonstrated it beats a naive baseline over the 3 gameweeks
+  available so far this season. It's built on sound statistical principles
+  (Poisson goal models, recency weighting, Bayesian shrinkage) but
+  early-season team strength ratings are themselves low-sample, which
+  likely blunts the fixture-difficulty signal the model leans on.
+- The trained linear model (`ml.py`) currently *does* beat both the
+  heuristic and the naive baseline in forward-chained validation — but on
+  only 2 validation folds so far. Re-run `fpl train` and `fpl backtest` as
+  more gameweeks accumulate before trusting either engine's picks blindly.
+- Training data for the linear model is limited to this season's finished
+  gameweeks (the API doesn't expose historical price/injury state). A
+  multi-season external dataset (e.g. the public vaastav/Fantasy-Premier-League
+  archive) would give the regression far more rows to learn from — a
+  natural next step if this season's small sample turns out not to
+  generalize.
