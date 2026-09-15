@@ -103,6 +103,65 @@ streamlit run app/dashboard.py
 Gives you an interactive pitch view of the optimal squad, a sortable table
 of every player's expected points, and a per-player breakdown explorer.
 
+### Backtesting
+
+```bash
+fpl backtest                    # test against every finished gameweek so far
+fpl backtest --gws 3 4          # test specific gameweeks
+```
+
+This rebuilds predictions using *only* data that would genuinely have been
+available before each gameweek (match history up to that point, team
+strength from earlier results only) and checks them against what actually
+happened — the honest test of whether the model is worth anything, not just
+a demo of it running. It reports:
+
+- **Point-level accuracy**: Pearson/Spearman correlation and mean absolute
+  error between predicted and actual points, benchmarked against a naive
+  baseline (each player's own season-to-date average, with no fixture or
+  form-recency information at all).
+- **Squad-level validation**: what the optimizer's recommended squad would
+  actually have scored that gameweek, against the average and highest
+  scores real FPL managers achieved (both reported by the API itself).
+
+**Results as measured against GW2-4 of the 2026/27 season** (the only
+finished gameweeks so far):
+
+| GW | Model r | Naive r | Model MAE | Naive MAE | Squad pts | Avg. manager |
+|----|---------|---------|-----------|-----------|-----------|--------------|
+| 2  | 0.310   | 0.411   | 1.93      | 1.35      | 49        | 81           |
+| 3  | 0.397   | 0.420   | 1.85      | 1.33      | 53        | 51           |
+| 4  | 0.392   | 0.483   | 1.97      | 1.35      | 46        | 69           |
+
+Told straight: **over this tiny sample, the full model does not yet beat
+the naive "just use their recent average" baseline**, and the backtested
+squads underperformed the average real manager in 2 of 3 gameweeks. I
+looked into why rather than just reporting the number:
+
+- I tried strengthening the small-sample shrinkage (the mechanism that
+  prevents one lucky early game from dominating a player's rate) across a
+  wide range of settings. It didn't help — correlation was flat to
+  slightly worse, and squad points got worse as shrinkage increased. So
+  the gap isn't an undershrunk-outlier bug with an easy fix.
+- The more likely cause: this is GW2-4 of a new season. The team-level
+  attack/defence ratings that drive the fixture-difficulty and clean-sheet
+  logic are themselves built from only 1-3 finished matches per team at
+  that point — too little to add real signal, so they mostly add noise on
+  top of a simpler "recent form" signal the naive baseline already
+  captures well. A model that leans on fixture context should earn its
+  keep *more*, not less, as the season's sample size grows.
+- 3 gameweeks is also just a very small, high-variance sample for a sport
+  with this much single-match randomness (one red card or deflection swings
+  a result by several points) — not enough to distinguish a genuinely worse
+  model from bad luck.
+
+The honest conclusion: **the model is not yet validated as better than a
+trivial baseline**, and this needs re-checking once more gameweeks have
+been played. I'm leaving the backtest command in specifically so that claim
+is checkable, not asserted. Re-run `fpl backtest` periodically as the season
+progresses — if the gap doesn't close, that's a real signal to revisit
+`predict.py`'s fixture-difficulty weighting rather than trust it by default.
+
 ### Tests
 
 ```bash
@@ -123,6 +182,7 @@ fpl_optimizer/
   features.py   team strength ratings, player form, minutes model, shrinkage
   predict.py    the expected-points model
   optimize.py   the ILP squad builder and transfer optimizer
+  backtest.py   validates predictions against already-finished gameweeks
   cli.py        command-line interface
 app/
   dashboard.py  Streamlit UI
@@ -140,6 +200,10 @@ tests/
 - **No price-change or long-term squad planning** (e.g. holding a transfer
   for a better week, chip strategy) — each run is a fresh optimization, not
   a multi-week plan.
-- The model has not been backtested against actual gameweek outcomes; it's
-  built on sound statistical principles (Poisson goal models, recency
-  weighting, Bayesian shrinkage) but hasn't been validated for calibration.
+- The model **has** been backtested (see above) — and, honestly, hasn't yet
+  demonstrated it beats a naive baseline over the 3 gameweeks available so
+  far this season. It's built on sound statistical principles (Poisson goal
+  models, recency weighting, Bayesian shrinkage) but early-season team
+  strength ratings are themselves low-sample, which likely blunts the
+  fixture-difficulty signal the model leans on. Worth re-running `fpl
+  backtest` as more gameweeks accumulate before trusting its picks blindly.

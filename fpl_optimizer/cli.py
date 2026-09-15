@@ -14,6 +14,7 @@ import sys
 import pandas as pd
 
 from . import api
+from .backtest import backtest_gameweek, finished_gameweeks
 from .data import current_and_next_gameweek, fixtures_frame, players_frame, scoring_rules, squad_rules, teams_frame
 from .optimize import build_squad, optimize_transfers
 from .predict import predict
@@ -22,7 +23,7 @@ pd.set_option("display.width", 160)
 pd.set_option("display.max_colwidth", 30)
 
 
-def _load_data(refresh: bool, horizon: int):
+def _load_raw_data(refresh: bool):
     print("Loading FPL data..." + (" (refreshing from API)" if refresh else " (cached)"), file=sys.stderr)
     bootstrap = api.get_bootstrap(refresh=refresh)
     fixtures = api.get_fixtures(refresh=refresh)
@@ -41,7 +42,11 @@ def _load_data(refresh: bool, horizon: int):
             print(f"  {done}/{total}", file=sys.stderr)
 
     summaries = api.get_all_element_summaries(list(players_df.index), refresh=refresh, on_progress=progress)
+    return bootstrap, players_df, teams_df, fixtures_df, rules, scoring, summaries, next_gw
 
+
+def _load_data(refresh: bool, horizon: int):
+    bootstrap, players_df, teams_df, fixtures_df, rules, scoring, summaries, next_gw = _load_raw_data(refresh)
     predicted = predict(players_df, teams_df, fixtures_df, summaries, scoring, start_gw=next_gw, num_gws=horizon)
     return predicted, teams_df, rules, next_gw
 
@@ -108,6 +113,52 @@ def cmd_player(args):
                 print(f"      opponent history modifier: {fx['opponent_history_modifier']}x (from {fx['h2h_sample_size']} past meeting(s))")
 
 
+def cmd_backtest(args):
+    bootstrap, players_df, teams_df, fixtures_df, rules, scoring, summaries, next_gw = _load_raw_data(args.refresh)
+    gws = args.gws if args.gws else finished_gameweeks(bootstrap)
+    gws = [g for g in gws if g >= 2]  # GW1 has no prior history to build a model from
+    if not gws:
+        print("No finished gameweeks (after GW1) available to backtest yet.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"\nBacktesting gameweeks {gws}")
+    print(
+        "(approximations: today's prices and availability stand in for the values at the time,\n"
+        " since the API doesn't expose price/injury history)\n"
+    )
+    header = f"{'GW':>3}  {'model r':>8}  {'naive r':>8}  {'model MAE':>10}  {'naive MAE':>10}  {'squad pts':>10}  {'avg mgr':>8}  {'top mgr':>8}"
+    print(header)
+    print("-" * len(header))
+
+    results = []
+    for gw in gws:
+        result = backtest_gameweek(bootstrap, players_df, teams_df, fixtures_df, summaries, scoring, rules, gw)
+        results.append(result)
+        print(
+            f"{result.gameweek:>3}  {result.pearson_r:>8.3f}  {result.naive_pearson_r:>8.3f}  "
+            f"{result.mae:>10.3f}  {result.naive_mae:>10.3f}  {result.squad_actual_points:>10.1f}  "
+            f"{result.average_entry_score or float('nan'):>8}  {result.highest_score or float('nan'):>8}"
+        )
+
+    n = len(results)
+    avg_r = sum(r.pearson_r for r in results) / n
+    avg_naive_r = sum(r.naive_pearson_r for r in results) / n
+    avg_mae = sum(r.mae for r in results) / n
+    avg_naive_mae = sum(r.naive_mae for r in results) / n
+    avg_squad_pts = sum(r.squad_actual_points for r in results) / n
+    avg_mgr = sum(r.average_entry_score for r in results if r.average_entry_score is not None) / n
+    print("-" * len(header))
+    print(
+        f"avg  {avg_r:>8.3f}  {avg_naive_r:>8.3f}  {avg_mae:>10.3f}  {avg_naive_mae:>10.3f}  "
+        f"{avg_squad_pts:>10.1f}  {avg_mgr:>8.1f}"
+    )
+    print(
+        f"\nModel correlation {'beats' if avg_r > avg_naive_r else 'does not beat'} the naive "
+        f"season-average baseline ({avg_r:.3f} vs {avg_naive_r:.3f} Pearson r)."
+    )
+    print(f"The optimizer's backtested squads averaged {avg_squad_pts:.1f} pts/GW vs an average manager's {avg_mgr:.1f}.")
+
+
 def main():
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--horizon", type=int, default=1, help="number of gameweeks to weigh (default: 1)")
@@ -130,6 +181,16 @@ def main():
     p_player = sub.add_parser("player", help="explain one player's expected-points breakdown", parents=[common])
     p_player.add_argument("name", help="player name (or partial match)")
     p_player.set_defaults(func=cmd_player)
+
+    p_backtest = sub.add_parser(
+        "backtest",
+        help="validate the model against already-finished gameweeks",
+        parents=[common],
+    )
+    p_backtest.add_argument(
+        "--gws", type=int, nargs="+", default=None, help="specific gameweeks to test (default: all finished so far)"
+    )
+    p_backtest.set_defaults(func=cmd_backtest)
 
     args = parser.parse_args()
     args.func(args)

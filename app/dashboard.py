@@ -14,6 +14,7 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from fpl_optimizer import api
+from fpl_optimizer.backtest import backtest_gameweek, finished_gameweeks
 from fpl_optimizer.data import current_and_next_gameweek, fixtures_frame, players_frame, scoring_rules, squad_rules, teams_frame
 from fpl_optimizer.optimize import build_squad
 from fpl_optimizer.predict import predict
@@ -24,7 +25,7 @@ FORMATION_ROWS = ["GKP", "DEF", "MID", "FWD"]
 
 
 @st.cache_data(show_spinner=False, ttl=6 * 60 * 60)
-def load_predictions(horizon: int, refresh: bool) -> tuple[pd.DataFrame, pd.DataFrame, object, int]:
+def load_raw_data(refresh: bool):
     bootstrap = api.get_bootstrap(refresh=refresh)
     fixtures = api.get_fixtures(refresh=refresh)
     teams_df = teams_frame(bootstrap)
@@ -43,9 +44,21 @@ def load_predictions(horizon: int, refresh: bool) -> tuple[pd.DataFrame, pd.Data
 
     summaries = api.get_all_element_summaries(ids, refresh=refresh, on_progress=on_progress)
     progress.empty()
+    return bootstrap, players_df, teams_df, fixtures_df, rules, scoring, summaries, next_gw
 
+
+@st.cache_data(show_spinner=False, ttl=6 * 60 * 60)
+def load_predictions(horizon: int, refresh: bool) -> tuple[pd.DataFrame, pd.DataFrame, object, int]:
+    bootstrap, players_df, teams_df, fixtures_df, rules, scoring, summaries, next_gw = load_raw_data(refresh)
     predicted = predict(players_df, teams_df, fixtures_df, summaries, scoring, start_gw=next_gw, num_gws=horizon)
     return predicted, teams_df, rules, next_gw
+
+
+@st.cache_data(show_spinner=False, ttl=6 * 60 * 60)
+def run_backtest(refresh: bool):
+    bootstrap, players_df, teams_df, fixtures_df, rules, scoring, summaries, _ = load_raw_data(refresh)
+    gws = [g for g in finished_gameweeks(bootstrap) if g >= 2]
+    return [backtest_gameweek(bootstrap, players_df, teams_df, fixtures_df, summaries, scoring, rules, gw) for gw in gws]
 
 
 def render_pitch(squad, predicted: pd.DataFrame):
@@ -102,7 +115,9 @@ def main():
     with st.spinner("Loading..."):
         predicted, teams_df, rules, next_gw = load_predictions(horizon, refresh)
 
-    tab_squad, tab_players, tab_player_detail = st.tabs(["Optimal Squad", "All Players", "Player Explorer"])
+    tab_squad, tab_players, tab_player_detail, tab_backtest = st.tabs(
+        ["Optimal Squad", "All Players", "Player Explorer", "Backtest"]
+    )
 
     with tab_squad:
         squad = build_squad(predicted, rules, budget=budget)
@@ -127,6 +142,62 @@ def main():
             matches = predicted[predicted["name"].str.contains(name, case=False, na=False)]
             for _, row in matches.head(5).iterrows():
                 render_player_breakdown(row)
+
+    with tab_backtest:
+        st.caption(
+            "Rebuilds predictions using only data that would have been available before each already-played "
+            "gameweek, then checks them against what actually happened — the honest test of whether this model "
+            "is worth anything, not just a demo of it running."
+        )
+        with st.spinner("Backtesting finished gameweeks..."):
+            results = run_backtest(refresh)
+        if not results:
+            st.info("No finished gameweeks (beyond GW1) yet — nothing to backtest against.")
+        else:
+            summary = pd.DataFrame(
+                [
+                    {
+                        "GW": r.gameweek,
+                        "Model r": round(r.pearson_r, 3),
+                        "Naive r": round(r.naive_pearson_r, 3),
+                        "Model MAE": round(r.mae, 3),
+                        "Naive MAE": round(r.naive_mae, 3),
+                        "Squad pts": r.squad_actual_points,
+                        "Avg manager": r.average_entry_score,
+                        "Top manager": r.highest_score,
+                    }
+                    for r in results
+                ]
+            )
+            st.dataframe(summary, hide_index=True, use_container_width=True)
+
+            avg_model_r = summary["Model r"].mean()
+            avg_naive_r = summary["Naive r"].mean()
+            avg_squad_pts = summary["Squad pts"].mean()
+            avg_mgr = summary["Avg manager"].mean()
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Model vs. naive baseline (r)", f"{avg_model_r:.3f}", f"{avg_model_r - avg_naive_r:+.3f}")
+            c2.metric("Backtested squad pts/GW", f"{avg_squad_pts:.1f}")
+            c3.metric("Avg. real manager pts/GW", f"{avg_mgr:.1f}")
+
+            if avg_model_r <= avg_naive_r:
+                st.warning(
+                    "Over these gameweeks, the full model doesn't yet beat the naive baseline (each player's own "
+                    "season-to-date average). This early in a season, team-strength and fixture-difficulty signals "
+                    "are themselves built on very few matches, so they add noise rather than signal — and 2-4 "
+                    "gameweeks is too small a sample to draw a firm conclusion either way. Worth re-checking as "
+                    "more gameweeks accumulate."
+                )
+            else:
+                st.success("Over these gameweeks, the full model beats the naive season-average baseline.")
+
+            gw_choice = st.selectbox("Inspect one gameweek's predictions vs. actual", [r.gameweek for r in results])
+            chosen = next(r for r in results if r.gameweek == gw_choice)
+            st.dataframe(
+                chosen.predictions.sort_values("predicted_points", ascending=False).reset_index(drop=True),
+                use_container_width=True,
+                height=400,
+            )
 
 
 if __name__ == "__main__":
