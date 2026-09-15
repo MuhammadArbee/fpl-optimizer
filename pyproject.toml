@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fpl-optimizer"
+version = "0.1.0"
+description = "Expected-points model and integer-programming squad optimizer for Fantasy Premier League"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+dependencies = [
+    "requests>=2.31",
+    "pandas>=2.1",
+    "numpy>=1.26",
+    "ortools>=9.10",
+]
+
+[project.optional-dependencies]
+dashboard = ["streamlit>=1.38"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+fpl = "fpl_optimizer.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["fpl_optimizer*"]
